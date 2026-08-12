@@ -1,0 +1,19 @@
+[package]
+name = "paxi-otc"
+version = "0.3.0"
+edition = "2021"
+description = "Paxi Network OTC contract with admin & fee splitting"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cosmwasm-std = "1.5"
+cw-storage-plus = "1.2"
+cw2 = "1.1"
+serde = { version = "1", features = ["derive"] }
+schemars = "0.8"
+thiserror = "1"
+
+[dev-dependencies]
+cosmwasm-std = "1.5"

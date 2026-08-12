@@ -6,7 +6,7 @@ Paxi 链上 IBC 包装资产的任意两两兑换。
 ## 项目结构
 
 ```
-paxi-otc-jianhua/
+paxi-otc/
 ├── index.html          # 前端 DApp 入口
 ├── app.js              # 前端核心逻辑
 ├── shared.js           # 网络配置、交易构建、工具函数
@@ -17,6 +17,7 @@ paxi-otc-jianhua/
 │       ├── lib.rs
 │       ├── msg.rs       # 消息定义
 │       ├── state.rs     # 状态存储
+│       ├── error.rs     # 错误类型
 │       └── contract.rs  # 核心逻辑
 └── README.md
 ```
@@ -60,8 +61,13 @@ CosmWasm OTC 合约使用 Cosmos SDK `bank` 模块（`info.funds` + `BankMsg::Se
 - **市场浏览**：查看所有活跃挂单，显示单价和剩余时间；支持按「卖出币种/买入币种」筛选
 - **创建挂单**：卖家存入代币到智能合约托管，可一键填入最大余额，内置常见代币
 - **购买（吃单）**：买家支付对应代币，合约自动交割，支持找零、误发代币原路退回
-- **取消挂单**：卖家随时取消，代币立即退回
-- **超时退款**：挂单超时后，卖家可取回代币
+- **取消挂单**：卖家随时取消，代币立即退回（即使合约暂停也可取消）
+- **超时退款**：挂单超时后，卖家可取回代币（即使合约暂停也可退款）
+- **手续费分账**：支持两个手续费收款地址，按比例自动分账
+- **白名单机制**：管理员可开启白名单模式，仅允许白名单地址挂单
+- **合约暂停**：管理员可暂停合约（暂停期间仍允许取消/退款，保障资金安全）
+- **管理员转移**：支持转移管理员权限
+- **合约升级**：内置 migrate 入口，支持合约平滑升级
 - **合约部署**：支持从 DApp 内直接通过 Code ID 实例化合约
 - **钱包余额面板**：连接钱包后自动展示所有链上余额（PAXI/USDC/USDT/ETH/BNB/SOL/BTC...）
 
@@ -124,6 +130,26 @@ paxid tx wasm store ./artifacts/paxi_otc.wasm \
 
 #### 2.5 实例化合约
 
+实例化时需要传入以下参数：
+
+```json
+{
+  "admin": "paxi1...",
+  "fee_rate": 100,
+  "fee_address_1": "paxi1...",
+  "fee_address_2": "paxi1...",
+  "fee_split_ratio": 6000
+}
+```
+
+| 参数 | 说明 |
+|------|------|
+| `admin` | 合约管理员地址 |
+| `fee_rate` | 手续费比例（万分比），如 100 = 1%，范围 0-10000 |
+| `fee_address_1` | 手续费收款地址 1（你的地址） |
+| `fee_address_2` | 手续费收款地址 2（合伙人地址，不能与地址 1 相同） |
+| `fee_split_ratio` | 地址 1 的分账比例（万分比），如 6000 = 你拿 60%，范围 0-10000 |
+
 **方式 A：在 DApp 中实例化（推荐）**
 
 1. 打开 DApp，连接钱包
@@ -134,7 +160,7 @@ paxid tx wasm store ./artifacts/paxi_otc.wasm \
 **方式 B：命令行实例化**
 
 ```bash
-paxid tx wasm instantiate <CodeID> '{}' \
+paxid tx wasm instantiate <CodeID> '{"admin":"paxi1...","fee_rate":100,"fee_address_1":"paxi1...","fee_address_2":"paxi1...","fee_split_ratio":6000}' \
   --from <钱包名称> \
   --label "Paxi OTC Market" \
   --gas 500000 \
@@ -156,35 +182,80 @@ paxid tx wasm instantiate <CodeID> '{}' \
 
 ### 执行消息 (ExecuteMsg)
 
+#### 交易功能
+
 | 操作 | 消息 | 附带资金 | 说明 |
 |------|------|----------|------|
-| 创建挂单 | `{ "create_order": { "ask_denom": "uusdc", "ask_amount": "1000000", "timeout": 604800 } }` | offer 代币 | 卖家存入代币 |
-| 购买 | `{ "execute_order": { "id": 1 } }` | ask 代币 | 买家付款，自动交割 |
-| 取消 | `{ "cancel_order": { "id": 1 } }` | 无 | 仅卖家可取消 |
-| 退款 | `{ "refund_order": { "id": 1 } }` | 无 | 仅超时后卖家可退款 |
+| 创建挂单 | `{ "create_order": { "offer_amount": "1000000", "offer_denom": "uusdc", "ask_amount": "5000000", "ask_denom": "upaxi", "expires_at": 1700000000 } }` | offer 代币 | 卖家存入代币，过期时间为 Unix 秒（距当前不得超过 90 天） |
+| 购买 | `{ "execute_order": { "order_id": 1 } }` | ask 代币 | 买家付款，自动交割，多付部分自动找零 |
+| 取消 | `{ "cancel_order": { "order_id": 1 } }` | 无 | 仅卖家可取消，合约暂停时也可操作 |
+| 退款 | `{ "refund_order": { "order_id": 1 } }` | 无 | 仅超时后卖家可退款，合约暂停时也可操作 |
+
+#### 管理员功能
+
+| 操作 | 消息 | 说明 |
+|------|------|------|
+| 暂停合约 | `{ "pause": {} }` | 暂停期间禁止创建/执行订单，但允许取消和退款 |
+| 恢复合约 | `{ "resume": {} }` | 恢复合约正常运作 |
+| 修改手续费比例 | `{ "update_fee_rate": { "new_fee_rate": 50 } }` | 万分比，范围 0-10000 |
+| 修改收款地址（两个） | `{ "update_fee_addresses": { "fee_address_1": "paxi1...", "fee_address_2": "paxi1..." } }` | 两个地址不能相同 |
+| 仅修改收款地址 1 | `{ "update_fee_address_1": { "fee_address_1": "paxi1..." } }` | 不能与地址 2 相同 |
+| 仅修改收款地址 2 | `{ "update_fee_address_2": { "fee_address_2": "paxi1..." } }` | 不能与地址 1 相同 |
+| 修改分账比例 | `{ "update_fee_split": { "new_split_ratio": 5000 } }` | 地址 1 占比，万分比 |
+| 转移管理员 | `{ "update_admin": { "new_admin": "paxi1..." } }` | 转移管理员权限 |
+| 添加白名单 | `{ "add_to_whitelist": { "address": "paxi1..." } }` | 添加地址到白名单 |
+| 移除白名单 | `{ "remove_from_whitelist": { "address": "paxi1..." } }` | 从白名单移除地址 |
+| 开关白名单 | `{ "toggle_whitelist": { "enabled": true } }` | 开启/关闭白名单模式 |
 
 ### 查询消息 (QueryMsg)
 
 | 查询 | 消息 | 返回 |
 |------|------|------|
-| 查询单个订单 | `{ "get_order": { "id": 1 } }` | Order |
-| 列出所有订单 | `{ "list_orders": { "limit": 50 } }` | Vec\<Order\> |
-| 列出活跃订单 | `{ "list_active_orders": { "limit": 100 } }` | Vec\<Order\> |
-| 查询卖家订单 | `{ "list_orders_by_seller": { "seller": "paxi1..." } }` | Vec\<Order\> |
-| 订单总数 | `{ "get_order_count": {} }` | u64 |
+| 查询单个订单 | `{ "get_order": { "order_id": 1 } }` | Order |
+| 列出所有订单 | `{ "list_orders": { "start_after": null, "limit": 50 } }` | Vec\<Order\> |
+| 列出活跃订单 | `{ "list_active_orders": { "start_after": null, "limit": 100 } }` | Vec\<Order\> |
+| 查询卖家订单 | `{ "list_orders_by_seller": { "seller": "paxi1...", "start_after": null, "limit": 50 } }` | Vec\<Order\> |
+| 订单总数 | `{ "get_order_count": {} }` | { count: u64 } |
+| 合约配置 | `{ "get_config": {} }` | ConfigResponse |
+| 是否暂停 | `{ "is_paused": {} }` | { paused: bool } |
+| 是否在白名单 | `{ "is_whitelisted": { "address": "paxi1..." } }` | { whitelisted: bool } |
+| 手续费信息 | `{ "get_fee_info": {} }` | FeeInfoResponse |
+| 白名单开关 | `{ "is_whitelist_enabled": {} }` | { enabled: bool } |
+
+## 手续费计算
+
+手续费按万分比收取，并按比例分给两个地址：
+
+```
+手续费总额 = 求购数量 × fee_rate / 10000
+卖家所得 = 求购数量 - 手续费总额
+地址 1 所得 = 手续费总额 × fee_split_ratio / 10000
+地址 2 所得 = 手续费总额 - 地址 1 所得
+```
+
+示例：买家支付 5000 upaxi，fee_rate=100 (1%)，fee_split_ratio=6000 (60%)
+- 手续费总额 = 50 upaxi
+- 卖家所得 = 4950 upaxi
+- 地址 1 所得 = 30 upaxi
+- 地址 2 所得 = 20 upaxi
 
 ## 安全特性
 
 - 所有交易由智能合约托管，无需信任第三方
 - 买家多付的代币会自动找零退回
-- 买家误发的其他代币会原路退回
+- 卖家不能购买自己的订单（防止自买自卖）
+- 挂单代币和求购代币不能相同（避免无意义订单）
+- 合约暂停时仍允许取消/退款，保障用户资金安全
+- 两个手续费收款地址不能相同
+- 过期时间使用 Unix 时间戳，最大有效期 90 天
 - 卖家可随时取消活跃挂单，代币立即退回
 - 挂单超时后，卖家可发起退款取回代币
-- 订单 ID 自增，不可篡改
+- 订单 ID 自增，使用 checked_add 防止溢出
+- 支持白名单模式，可限制挂单权限
 
 ## 技术栈
 
-- **智能合约**：Rust + CosmWasm 1.5.0
+- **智能合约**：Rust + CosmWasm 1.5（合约版本 0.3.0）
 - **前端**：原生 HTML/JS/CSS（无构建步骤）
 - **钱包**：PaxiHub
 - **SDK**：PaxiCosmJS + 自定义 protobuf 兼容层
