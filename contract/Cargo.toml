@@ -3,6 +3,9 @@ name = "paxi-otc"
 version = "0.3.0"
 edition = "2021"
 description = "Paxi Network OTC contract with admin & fee splitting"
+license = "MIT"
+# 免责声明：本合约仅供试验、调试、技术研究用途，不得用于实际交易或商业用途。
+# 部署即视为同意 README.md 中的免责声明全部条款。
 
 [lib]
 crate-type = ["cdylib", "rlib"]
