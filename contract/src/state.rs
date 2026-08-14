@@ -6,9 +6,6 @@ use serde::{Deserialize, Serialize};
 /// 订单基础单位：万分之一
 pub const BASIS_POINTS: u64 = 10000;
 
-/// 订单最大有效期：90 天（以秒为单位）
-pub const MAX_EXPIRATION: u64 = 90 * 24 * 60 * 60;
-
 /// 全局配置（单例）
 pub const CONFIG: Item<Config> = Item::new("config");
 
@@ -79,8 +76,8 @@ pub struct Order {
     pub ask_denom: String,
     /// 订单状态
     pub status: OrderStatus,
-    /// 创建时间（Unix 秒）
+    /// 创建时间（区块高度）
     pub created_at: u64,
-    /// 过期时间（Unix 秒）
+    /// 过期时间（区块高度）
     pub expires_at: u64,
 }

@@ -1,27 +1,28 @@
 use cosmwasm_std::{
-    entry_point, to_json_binary, BankMsg, Binary, Coin, Deps, DepsMut, Env, MessageInfo,
-    Order as StdOrder, Response, StdResult, Uint128,
+    entry_point, to_json_binary, BankMsg, Binary, Coin, CosmosMsg, Deps, DepsMut, Env,
+    MessageInfo, Order as StdOrder, Response, StdResult, Uint128,
 };
 
 use crate::error::ContractError;
 use crate::msg::{
-    ConfigResponse, ExecuteMsg, FeeInfoResponse, InstantiateMsg, MigrateMsg, OrderCountResponse,
+    ConfigResponse, ExecuteMsg, FeeInfoResponse, InstantiateMsg, OrderCountResponse,
     OrdersResponse, PausedResponse, QueryMsg, WhitelistEnabledResponse, WhitelistedResponse,
 };
 use crate::state::{
-    Config, Order, OrderStatus, BASIS_POINTS, CONFIG, MAX_EXPIRATION, ORDERS, ORDER_COUNT, PAUSED,
-    WHITELIST, WHITELIST_ENABLED,
+    Config, Order, OrderStatus, BASIS_POINTS, CONFIG, ORDERS, ORDER_COUNT, PAUSED, WHITELIST,
+    WHITELIST_ENABLED,
 };
 use cw2::set_contract_version;
+use cw_storage_plus::Bound;
 
 const CONTRACT_NAME: &str = "paxi-otc";
-const CONTRACT_VERSION: &str = "0.3.0";
+const CONTRACT_VERSION: &str = "0.2.0";
 
 const DEFAULT_LIMIT: u32 = 30;
 const MAX_LIMIT: u32 = 100;
 
 // ============================================================
-// INSTANTIATE — 合约初始化（部署时执行一次）
+// INSTANTIATE
 // ============================================================
 #[entry_point]
 pub fn instantiate(
@@ -30,10 +31,8 @@ pub fn instantiate(
     _info: MessageInfo,
     msg: InstantiateMsg,
 ) -> Result<Response, ContractError> {
-    // 设置合约版本（cw2 标准）
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
-    // 校验参数
     if msg.fee_rate > BASIS_POINTS {
         return Err(ContractError::InvalidFeeRate);
     }
@@ -41,26 +40,15 @@ pub fn instantiate(
         return Err(ContractError::InvalidSplitRatio);
     }
 
-    let admin = deps.api.addr_validate(&msg.admin)?;
-    let fee_address_1 = deps.api.addr_validate(&msg.fee_address_1)?;
-    let fee_address_2 = deps.api.addr_validate(&msg.fee_address_2)?;
-
-    // 两个手续费收款地址不能相同
-    if fee_address_1 == fee_address_2 {
-        return Err(ContractError::DuplicateFeeAddress);
-    }
-
-    // 保存配置
     let config = Config {
-        admin,
+        admin: deps.api.addr_validate(&msg.admin)?,
         fee_rate: msg.fee_rate,
-        fee_address_1,
-        fee_address_2,
+        fee_address_1: deps.api.addr_validate(&msg.fee_address_1)?,
+        fee_address_2: deps.api.addr_validate(&msg.fee_address_2)?,
         fee_split_ratio: msg.fee_split_ratio,
     };
     CONFIG.save(deps.storage, &config)?;
 
-    // 初始化状态
     PAUSED.save(deps.storage, &false)?;
     ORDER_COUNT.save(deps.storage, &0)?;
     WHITELIST_ENABLED.save(deps.storage, &false)?;
@@ -69,7 +57,7 @@ pub fn instantiate(
 }
 
 // ============================================================
-// EXECUTE — 所有写操作入口
+// EXECUTE
 // ============================================================
 #[entry_point]
 pub fn execute(
@@ -79,50 +67,35 @@ pub fn execute(
     msg: ExecuteMsg,
 ) -> Result<Response, ContractError> {
     match msg {
-        // -- 交易功能
         ExecuteMsg::CreateOrder {
             offer_amount,
             offer_denom,
             ask_amount,
             ask_denom,
             expires_at,
-        } => execute_create_order(
-            deps,
-            env,
-            info,
-            offer_amount,
-            offer_denom,
-            ask_amount,
-            ask_denom,
-            expires_at,
-        ),
+        } => execute_create_order(deps, env, info, offer_amount, offer_denom, ask_amount, ask_denom, expires_at),
 
         ExecuteMsg::ExecuteOrder { order_id } => {
             execute_execute_order(deps, env, info, order_id)
         }
 
-        // cancel / refund 不受 pause 影响，确保用户随时可取回资金
-        ExecuteMsg::CancelOrder { order_id } => execute_cancel_order(deps, info, order_id),
+        ExecuteMsg::CancelOrder { order_id } => {
+            execute_cancel_order(deps, env, info, order_id)
+        }
 
-        ExecuteMsg::RefundOrder { order_id } => execute_refund_order(deps, env, info, order_id),
+        ExecuteMsg::RefundOrder { order_id } => {
+            execute_refund_order(deps, env, info, order_id)
+        }
 
-        // -- 管理员功能
         ExecuteMsg::Pause {} => execute_pause(deps, info),
         ExecuteMsg::Resume {} => execute_resume(deps, info),
         ExecuteMsg::UpdateFeeRate { new_fee_rate } => execute_update_fee_rate(deps, info, new_fee_rate),
         ExecuteMsg::UpdateFeeAddresses { fee_address_1, fee_address_2 } => {
             execute_update_fee_addresses(deps, info, fee_address_1, fee_address_2)
         }
-        ExecuteMsg::UpdateFeeAddress1 { fee_address_1 } => {
-            execute_update_fee_address_1(deps, info, fee_address_1)
-        }
-        ExecuteMsg::UpdateFeeAddress2 { fee_address_2 } => {
-            execute_update_fee_address_2(deps, info, fee_address_2)
-        }
         ExecuteMsg::UpdateFeeSplit { new_split_ratio } => {
             execute_update_fee_split(deps, info, new_split_ratio)
         }
-        ExecuteMsg::UpdateAdmin { new_admin } => execute_update_admin(deps, info, new_admin),
         ExecuteMsg::AddToWhitelist { address } => execute_add_whitelist(deps, info, address),
         ExecuteMsg::RemoveFromWhitelist { address } => execute_remove_whitelist(deps, info, address),
         ExecuteMsg::ToggleWhitelist { enabled } => execute_toggle_whitelist(deps, info, enabled),
@@ -130,9 +103,8 @@ pub fn execute(
 }
 
 // ============================================================
-// 创建挂单
+// CREATE ORDER
 // ============================================================
-#[allow(clippy::too_many_arguments)]
 fn execute_create_order(
     deps: DepsMut,
     env: Env,
@@ -143,13 +115,9 @@ fn execute_create_order(
     ask_denom: String,
     expires_at: u64,
 ) -> Result<Response, ContractError> {
-    // 检查合约是否暂停
     check_paused(deps.as_ref())?;
-
-    // 检查白名单
     check_whitelist(deps.as_ref(), &info.sender)?;
 
-    // 参数校验
     if offer_amount.is_zero() {
         return Err(ContractError::InvalidOfferAmount);
     }
@@ -162,21 +130,10 @@ fn execute_create_order(
     if offer_denom.is_empty() {
         return Err(ContractError::EmptyOfferDenom);
     }
-    // 禁止同币种挂单（无意义订单）
-    if offer_denom == ask_denom {
-        return Err(ContractError::SameDenomNotAllowed);
-    }
-
-    // 过期时间使用 Unix 秒
-    let now = env.block.time.seconds();
-    if expires_at <= now {
+    if expires_at <= env.block.height {
         return Err(ContractError::InvalidExpiration);
     }
-    if expires_at > now.saturating_add(MAX_EXPIRATION) {
-        return Err(ContractError::ExpirationTooFar);
-    }
 
-    // 卖家必须发送挂单资产
     if info.funds.len() != 1 {
         return Err(ContractError::InvalidFunds);
     }
@@ -188,14 +145,9 @@ fn execute_create_order(
         });
     }
 
-    // 生成订单 ID（使用 checked_add 防止溢出）
-    let current_count = ORDER_COUNT.load(deps.storage)?;
-    let order_id = current_count
-        .checked_add(1)
-        .ok_or_else(|| ContractError::Std(cosmwasm_std::StdError::generic_err("订单 ID 溢出")))?;
+    let order_id = ORDER_COUNT.load(deps.storage)? + 1;
     ORDER_COUNT.save(deps.storage, &order_id)?;
 
-    // 创建订单
     let order = Order {
         id: order_id,
         seller: info.sender.clone(),
@@ -204,7 +156,7 @@ fn execute_create_order(
         ask_amount,
         ask_denom: ask_denom.clone(),
         status: OrderStatus::Active,
-        created_at: now,
+        created_at: env.block.height,
         expires_at,
     };
     ORDERS.save(deps.storage, order_id, &order)?;
@@ -216,7 +168,7 @@ fn execute_create_order(
 }
 
 // ============================================================
-// 执行订单（买家买入）— 核心：含手续费分账 + 找零逻辑
+// EXECUTE ORDER (BUY)
 // ============================================================
 fn execute_execute_order(
     deps: DepsMut,
@@ -226,25 +178,15 @@ fn execute_execute_order(
 ) -> Result<Response, ContractError> {
     check_paused(deps.as_ref())?;
 
-    // 加载订单
     let mut order = ORDERS.load(deps.storage, order_id)?;
 
-    // 校验订单状态
     if order.status != OrderStatus::Active {
         return Err(ContractError::OrderNotActive);
     }
-
-    // 校验是否过期（Unix 秒）
-    if order.expires_at <= env.block.time.seconds() {
+    if order.expires_at <= env.block.height {
         return Err(ContractError::OrderExpired);
     }
 
-    // 禁止卖家购买自己的订单
-    if order.seller == info.sender {
-        return Err(ContractError::SelfTradeNotAllowed);
-    }
-
-    // 校验买家支付
     if info.funds.len() != 1 {
         return Err(ContractError::NoFunds);
     }
@@ -255,35 +197,26 @@ fn execute_execute_order(
             actual: payment.denom.clone(),
         });
     }
-    // 允许超额支付，少付则报错
-    if payment.amount < order.ask_amount {
+    if payment.amount != order.ask_amount {
         return Err(ContractError::InsufficientPayment {
             expected: format!("{}{}", order.ask_amount, order.ask_denom),
             actual: format!("{}{}", payment.amount, payment.denom),
         });
     }
 
-    // 计算找零（多付部分原路退回）
-    let change = payment.amount - order.ask_amount;
-
-    // 加载配置
     let config = CONFIG.load(deps.storage)?;
 
-    // ----- 计算手续费分账 -----
     let fee_total = order
         .ask_amount
         .multiply_ratio(config.fee_rate, BASIS_POINTS);
 
     let seller_amount = order.ask_amount - fee_total;
 
-    // 手续费分给两个地址
     let fee_to_addr1 = fee_total.multiply_ratio(config.fee_split_ratio, BASIS_POINTS);
     let fee_to_addr2 = fee_total - fee_to_addr1;
 
-    // 构建转账消息列表
-    let mut messages = vec![];
+    let mut messages: Vec<CosmosMsg> = vec![];
 
-    // 1. 将挂单资产发送给买家
     messages.push(
         BankMsg::Send {
             to_address: info.sender.to_string(),
@@ -295,7 +228,6 @@ fn execute_execute_order(
         .into(),
     );
 
-    // 2. 卖家所得（扣除手续费后）发送给卖家
     if !seller_amount.is_zero() {
         messages.push(
             BankMsg::Send {
@@ -309,7 +241,6 @@ fn execute_execute_order(
         );
     }
 
-    // 3. 手续费分给地址 1
     if !fee_to_addr1.is_zero() {
         messages.push(
             BankMsg::Send {
@@ -323,7 +254,6 @@ fn execute_execute_order(
         );
     }
 
-    // 4. 手续费分给地址 2
     if !fee_to_addr2.is_zero() {
         messages.push(
             BankMsg::Send {
@@ -337,21 +267,6 @@ fn execute_execute_order(
         );
     }
 
-    // 5. 找零退回买家
-    if !change.is_zero() {
-        messages.push(
-            BankMsg::Send {
-                to_address: info.sender.to_string(),
-                amount: vec![Coin {
-                    denom: order.ask_denom.clone(),
-                    amount: change,
-                }],
-            }
-            .into(),
-        );
-    }
-
-    // 更新订单状态（先构建消息，最后落库）
     order.status = OrderStatus::Completed;
     ORDERS.save(deps.storage, order_id, &order)?;
 
@@ -363,29 +278,29 @@ fn execute_execute_order(
         .add_attribute("seller", order.seller.to_string())
         .add_attribute("fee_total", fee_total.to_string())
         .add_attribute("fee_to_addr_1", fee_to_addr1.to_string())
-        .add_attribute("fee_to_addr_2", fee_to_addr2.to_string())
-        .add_attribute("change", change.to_string()))
+        .add_attribute("fee_to_addr_2", fee_to_addr2.to_string()))
 }
 
 // ============================================================
-// 取消挂单（仅卖家，不受 pause 影响）
+// CANCEL ORDER
 // ============================================================
 fn execute_cancel_order(
     deps: DepsMut,
+    _env: Env,
     info: MessageInfo,
     order_id: u64,
 ) -> Result<Response, ContractError> {
+    check_paused(deps.as_ref())?;
+
     let mut order = ORDERS.load(deps.storage, order_id)?;
 
     if order.status != OrderStatus::Active {
         return Err(ContractError::OrderNotActive);
     }
-
     if order.seller != info.sender {
         return Err(ContractError::OnlySellerCanCancel);
     }
 
-    // 退还挂单资产给卖家
     let refund_msg = BankMsg::Send {
         to_address: order.seller.to_string(),
         amount: vec![Coin {
@@ -394,7 +309,6 @@ fn execute_cancel_order(
         }],
     };
 
-    // 更新订单状态
     order.status = OrderStatus::Cancelled;
     ORDERS.save(deps.storage, order_id, &order)?;
 
@@ -405,7 +319,7 @@ fn execute_cancel_order(
 }
 
 // ============================================================
-// 退款（仅卖家，订单过期后可退，不受 pause 影响）
+// REFUND ORDER
 // ============================================================
 fn execute_refund_order(
     deps: DepsMut,
@@ -413,22 +327,20 @@ fn execute_refund_order(
     info: MessageInfo,
     order_id: u64,
 ) -> Result<Response, ContractError> {
+    check_paused(deps.as_ref())?;
+
     let mut order = ORDERS.load(deps.storage, order_id)?;
 
     if order.status != OrderStatus::Active {
         return Err(ContractError::OrderNotActive);
     }
-
     if order.seller != info.sender {
         return Err(ContractError::OnlySellerCanRefund);
     }
-
-    // 必须已过期（Unix 秒）
-    if order.expires_at > env.block.time.seconds() {
+    if order.expires_at > env.block.height {
         return Err(ContractError::OrderNotExpired);
     }
 
-    // 退还挂单资产给卖家
     let refund_msg = BankMsg::Send {
         to_address: order.seller.to_string(),
         amount: vec![Coin {
@@ -437,7 +349,6 @@ fn execute_refund_order(
         }],
     };
 
-    // 更新订单状态
     order.status = OrderStatus::Refunded;
     ORDERS.save(deps.storage, order_id, &order)?;
 
@@ -448,9 +359,8 @@ fn execute_refund_order(
 }
 
 // ============================================================
-// 管理员功能
+// ADMIN FUNCTIONS
 // ============================================================
-
 fn check_admin(deps: Deps, sender: &cosmwasm_std::Addr) -> Result<(), ContractError> {
     let config = CONFIG.load(deps.storage)?;
     if config.admin != *sender {
@@ -481,8 +391,7 @@ fn execute_pause(deps: DepsMut, info: MessageInfo) -> Result<Response, ContractE
     PAUSED.save(deps.storage, &true)?;
     Ok(Response::new()
         .add_attribute("action", "pause")
-        .add_attribute("paused", "true")
-        .add_attribute("by", info.sender.to_string()))
+        .add_attribute("paused", "true"))
 }
 
 fn execute_resume(deps: DepsMut, info: MessageInfo) -> Result<Response, ContractError> {
@@ -490,8 +399,7 @@ fn execute_resume(deps: DepsMut, info: MessageInfo) -> Result<Response, Contract
     PAUSED.save(deps.storage, &false)?;
     Ok(Response::new()
         .add_attribute("action", "resume")
-        .add_attribute("paused", "false")
-        .add_attribute("by", info.sender.to_string()))
+        .add_attribute("paused", "false"))
 }
 
 fn execute_update_fee_rate(
@@ -509,8 +417,7 @@ fn execute_update_fee_rate(
     })?;
     Ok(Response::new()
         .add_attribute("action", "update_fee_rate")
-        .add_attribute("new_fee_rate", new_fee_rate.to_string())
-        .add_attribute("by", info.sender.to_string()))
+        .add_attribute("new_fee_rate", new_fee_rate.to_string()))
 }
 
 fn execute_update_fee_addresses(
@@ -522,9 +429,6 @@ fn execute_update_fee_addresses(
     check_admin(deps.as_ref(), &info.sender)?;
     let addr1 = deps.api.addr_validate(&fee_address_1)?;
     let addr2 = deps.api.addr_validate(&fee_address_2)?;
-    if addr1 == addr2 {
-        return Err(ContractError::DuplicateFeeAddress);
-    }
     CONFIG.update(deps.storage, |mut c| -> StdResult<_> {
         c.fee_address_1 = addr1.clone();
         c.fee_address_2 = addr2.clone();
@@ -533,52 +437,7 @@ fn execute_update_fee_addresses(
     Ok(Response::new()
         .add_attribute("action", "update_fee_addresses")
         .add_attribute("fee_address_1", addr1.to_string())
-        .add_attribute("fee_address_2", addr2.to_string())
-        .add_attribute("by", info.sender.to_string()))
-}
-
-fn execute_update_fee_address_1(
-    deps: DepsMut,
-    info: MessageInfo,
-    fee_address_1: String,
-) -> Result<Response, ContractError> {
-    check_admin(deps.as_ref(), &info.sender)?;
-    let addr1 = deps.api.addr_validate(&fee_address_1)?;
-    // 不能与现有的 fee_address_2 相同
-    let config = CONFIG.load(deps.storage)?;
-    if addr1 == config.fee_address_2 {
-        return Err(ContractError::DuplicateFeeAddress);
-    }
-    CONFIG.update(deps.storage, |mut c| -> StdResult<_> {
-        c.fee_address_1 = addr1.clone();
-        Ok(c)
-    })?;
-    Ok(Response::new()
-        .add_attribute("action", "update_fee_address_1")
-        .add_attribute("fee_address_1", addr1.to_string())
-        .add_attribute("by", info.sender.to_string()))
-}
-
-fn execute_update_fee_address_2(
-    deps: DepsMut,
-    info: MessageInfo,
-    fee_address_2: String,
-) -> Result<Response, ContractError> {
-    check_admin(deps.as_ref(), &info.sender)?;
-    let addr2 = deps.api.addr_validate(&fee_address_2)?;
-    // 不能与现有的 fee_address_1 相同
-    let config = CONFIG.load(deps.storage)?;
-    if addr2 == config.fee_address_1 {
-        return Err(ContractError::DuplicateFeeAddress);
-    }
-    CONFIG.update(deps.storage, |mut c| -> StdResult<_> {
-        c.fee_address_2 = addr2.clone();
-        Ok(c)
-    })?;
-    Ok(Response::new()
-        .add_attribute("action", "update_fee_address_2")
-        .add_attribute("fee_address_2", addr2.to_string())
-        .add_attribute("by", info.sender.to_string()))
+        .add_attribute("fee_address_2", addr2.to_string()))
 }
 
 fn execute_update_fee_split(
@@ -596,29 +455,7 @@ fn execute_update_fee_split(
     })?;
     Ok(Response::new()
         .add_attribute("action", "update_fee_split")
-        .add_attribute("new_split_ratio", new_split_ratio.to_string())
-        .add_attribute("by", info.sender.to_string()))
-}
-
-fn execute_update_admin(
-    deps: DepsMut,
-    info: MessageInfo,
-    new_admin: String,
-) -> Result<Response, ContractError> {
-    check_admin(deps.as_ref(), &info.sender)?;
-    let new_admin_addr = deps.api.addr_validate(&new_admin)?;
-    let config = CONFIG.load(deps.storage)?;
-    if new_admin_addr == config.admin {
-        return Err(ContractError::SameAdminAddress);
-    }
-    CONFIG.update(deps.storage, |mut c| -> StdResult<_> {
-        c.admin = new_admin_addr.clone();
-        Ok(c)
-    })?;
-    Ok(Response::new()
-        .add_attribute("action", "update_admin")
-        .add_attribute("new_admin", new_admin_addr.to_string())
-        .add_attribute("by", info.sender.to_string()))
+        .add_attribute("new_split_ratio", new_split_ratio.to_string()))
 }
 
 fn execute_add_whitelist(
@@ -634,8 +471,7 @@ fn execute_add_whitelist(
     WHITELIST.save(deps.storage, addr.clone(), &true)?;
     Ok(Response::new()
         .add_attribute("action", "add_to_whitelist")
-        .add_attribute("address", addr.to_string())
-        .add_attribute("by", info.sender.to_string()))
+        .add_attribute("address", addr.to_string()))
 }
 
 fn execute_remove_whitelist(
@@ -651,8 +487,7 @@ fn execute_remove_whitelist(
     WHITELIST.remove(deps.storage, addr.clone());
     Ok(Response::new()
         .add_attribute("action", "remove_from_whitelist")
-        .add_attribute("address", addr.to_string())
-        .add_attribute("by", info.sender.to_string()))
+        .add_attribute("address", addr.to_string()))
 }
 
 fn execute_toggle_whitelist(
@@ -664,21 +499,11 @@ fn execute_toggle_whitelist(
     WHITELIST_ENABLED.save(deps.storage, &enabled)?;
     Ok(Response::new()
         .add_attribute("action", "toggle_whitelist")
-        .add_attribute("enabled", enabled.to_string())
-        .add_attribute("by", info.sender.to_string()))
+        .add_attribute("enabled", enabled.to_string()))
 }
 
 // ============================================================
-// MIGRATE — 合约升级入口（仅更新版本号）
-// ============================================================
-#[entry_point]
-pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
-    set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
-    Ok(Response::new().add_attribute("action", "migrate"))
-}
-
-// ============================================================
-// QUERY — 所有查询入口
+// QUERY
 // ============================================================
 #[entry_point]
 pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
@@ -706,22 +531,12 @@ fn query_order(deps: Deps, order_id: u64) -> StdResult<Order> {
     ORDERS.load(deps.storage, order_id)
 }
 
-fn query_list_orders(
-    deps: Deps,
-    start_after: Option<u64>,
-    limit: Option<u32>,
-) -> StdResult<OrdersResponse> {
+fn query_list_orders(deps: Deps, start_after: Option<u64>, limit: Option<u32>) -> StdResult<OrdersResponse> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
     let orders: Vec<Order> = ORDERS
-        .range(
-            deps.storage,
-            start_after.map(|s| cosmwasm_std::Bound::exclusive(s)),
-            None,
-            StdOrder::Ascending,
-        )
+        .range(deps.storage, start_after.map(Bound::exclusive), None, StdOrder::Ascending)
         .take(limit)
-        .collect::<StdResult<Vec<_>>>()?
-        .into_iter()
+        .filter_map(|r| r.ok())
         .map(|(_, v)| v)
         .collect();
     Ok(OrdersResponse { orders })
@@ -733,14 +548,8 @@ fn query_list_active_orders(
     limit: Option<u32>,
 ) -> StdResult<OrdersResponse> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
-    // 先按状态过滤再 take，确保返回数量正确
     let orders: Vec<Order> = ORDERS
-        .range(
-            deps.storage,
-            start_after.map(|s| cosmwasm_std::Bound::exclusive(s)),
-            None,
-            StdOrder::Ascending,
-        )
+        .range(deps.storage, start_after.map(Bound::exclusive), None, StdOrder::Ascending)
         .filter_map(|r| r.ok())
         .map(|(_, v)| v)
         .filter(|o| o.status == OrderStatus::Active)
@@ -757,14 +566,8 @@ fn query_list_orders_by_seller(
 ) -> StdResult<OrdersResponse> {
     let seller_addr = deps.api.addr_validate(&seller)?;
     let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
-    // 先按卖家过滤再 take，确保返回数量正确
     let orders: Vec<Order> = ORDERS
-        .range(
-            deps.storage,
-            start_after.map(|s| cosmwasm_std::Bound::exclusive(s)),
-            None,
-            StdOrder::Ascending,
-        )
+        .range(deps.storage, start_after.map(Bound::exclusive), None, StdOrder::Ascending)
         .filter_map(|r| r.ok())
         .map(|(_, v)| v)
         .filter(|o| o.seller == seller_addr)
@@ -807,550 +610,4 @@ fn query_fee_info(deps: Deps) -> StdResult<FeeInfoResponse> {
         fee_address_2: config.fee_address_2.to_string(),
         fee_split_ratio: config.fee_split_ratio,
     })
-}
-
-// ============================================================
-// 单元测试
-// ============================================================
-#[cfg(test)]
-mod tests {
-    use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
-    use cosmwasm_std::{coins, from_binary, Addr, BankMsg, DepsMut, SubMsg, Timestamp, Uint128};
-
-    use super::{execute, instantiate, migrate, query};
-    use crate::error::ContractError;
-    use crate::msg::{
-        ExecuteMsg, InstantiateMsg, MigrateMsg, OrderCountResponse, OrdersResponse, QueryMsg,
-    };
-    use crate::state::{Order, MAX_EXPIRATION};
-
-    // 测试用常量
-    const ADMIN: &str = "paxi1admin";
-    const SELLER: &str = "paxi1seller";
-    const BUYER: &str = "paxi1buyer";
-    const FEE_ADDR_1: &str = "paxi1fee1";
-    const FEE_ADDR_2: &str = "paxi1fee2";
-    const OFFER_DENOM: &str = "uusdc";
-    const ASK_DENOM: &str = "upaxi";
-
-    fn default_instantiate() -> InstantiateMsg {
-        InstantiateMsg {
-            admin: ADMIN.to_string(),
-            fee_rate: 100, // 1%
-            fee_address_1: FEE_ADDR_1.to_string(),
-            fee_address_2: FEE_ADDR_2.to_string(),
-            fee_split_ratio: 6000, // 60% 给地址 1
-        }
-    }
-
-    /// 初始化合约，返回 env。调用方负责创建 deps 并传入 as_mut()。
-    fn init_contract(deps: DepsMut) -> cosmwasm_std::Env {
-        let msg = default_instantiate();
-        let info = mock_info(ADMIN, &[]);
-        let env = mock_env();
-        let res = instantiate(deps, env.clone(), info, msg).unwrap();
-        assert_eq!(res.attributes[0].value, "instantiate");
-        env
-    }
-
-    fn future_expires(env: &cosmwasm_std::Env, secs: u64) -> u64 {
-        env.block.time.seconds() + secs
-    }
-
-    /// 创建一个标准订单供执行测试使用
-    fn create_sample_order(deps: DepsMut, env: &cosmwasm_std::Env) {
-        let expires_at = future_expires(env, 86400);
-        let msg = ExecuteMsg::CreateOrder {
-            offer_amount: Uint128::new(1000),
-            offer_denom: OFFER_DENOM.to_string(),
-            ask_amount: Uint128::new(5000),
-            ask_denom: ASK_DENOM.to_string(),
-            expires_at,
-        };
-        let info = mock_info(SELLER, &coins(1000, OFFER_DENOM));
-        execute(deps, env.clone(), info, msg).unwrap();
-    }
-
-    // ---------- 初始化 ----------
-
-    #[test]
-    fn instantiate_works() {
-        let mut deps = mock_dependencies();
-        init_contract(deps.as_mut());
-    }
-
-    #[test]
-    fn instantiate_rejects_invalid_fee_rate() {
-        let mut deps = mock_dependencies();
-        let mut msg = default_instantiate();
-        msg.fee_rate = 10001;
-        let info = mock_info(ADMIN, &[]);
-        let err = instantiate(deps.as_mut(), mock_env(), info, msg).unwrap_err();
-        assert_eq!(err, ContractError::InvalidFeeRate);
-    }
-
-    #[test]
-    fn instantiate_rejects_duplicate_fee_addresses() {
-        let mut deps = mock_dependencies();
-        let mut msg = default_instantiate();
-        msg.fee_address_2 = FEE_ADDR_1.to_string();
-        let info = mock_info(ADMIN, &[]);
-        let err = instantiate(deps.as_mut(), mock_env(), info, msg).unwrap_err();
-        assert_eq!(err, ContractError::DuplicateFeeAddress);
-    }
-
-    // ---------- 创建挂单 ----------
-
-    #[test]
-    fn create_order_works() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        let expires_at = future_expires(&env, 86400);
-        let msg = ExecuteMsg::CreateOrder {
-            offer_amount: Uint128::new(1000),
-            offer_denom: OFFER_DENOM.to_string(),
-            ask_amount: Uint128::new(5000),
-            ask_denom: ASK_DENOM.to_string(),
-            expires_at,
-        };
-        let info = mock_info(SELLER, &coins(1000, OFFER_DENOM));
-        let res = execute(deps.as_mut(), env, info, msg).unwrap();
-        assert_eq!(res.attributes[1].value, "1");
-    }
-
-    #[test]
-    fn create_order_rejects_same_denom() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        let expires_at = future_expires(&env, 86400);
-        let msg = ExecuteMsg::CreateOrder {
-            offer_amount: Uint128::new(1000),
-            offer_denom: OFFER_DENOM.to_string(),
-            ask_amount: Uint128::new(2000),
-            ask_denom: OFFER_DENOM.to_string(),
-            expires_at,
-        };
-        let info = mock_info(SELLER, &coins(1000, OFFER_DENOM));
-        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-        assert_eq!(err, ContractError::SameDenomNotAllowed);
-    }
-
-    #[test]
-    fn create_order_rejects_past_expiration() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        let expires_at = env.block.time.seconds() - 10;
-        let msg = ExecuteMsg::CreateOrder {
-            offer_amount: Uint128::new(1000),
-            offer_denom: OFFER_DENOM.to_string(),
-            ask_amount: Uint128::new(5000),
-            ask_denom: ASK_DENOM.to_string(),
-            expires_at,
-        };
-        let info = mock_info(SELLER, &coins(1000, OFFER_DENOM));
-        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-        assert_eq!(err, ContractError::InvalidExpiration);
-    }
-
-    #[test]
-    fn create_order_rejects_too_far_expiration() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        let expires_at = env.block.time.seconds() + MAX_EXPIRATION + 1;
-        let msg = ExecuteMsg::CreateOrder {
-            offer_amount: Uint128::new(1000),
-            offer_denom: OFFER_DENOM.to_string(),
-            ask_amount: Uint128::new(5000),
-            ask_denom: ASK_DENOM.to_string(),
-            expires_at,
-        };
-        let info = mock_info(SELLER, &coins(1000, OFFER_DENOM));
-        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-        assert_eq!(err, ContractError::ExpirationTooFar);
-    }
-
-    #[test]
-    fn create_order_rejects_wrong_funds() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        let expires_at = future_expires(&env, 86400);
-        let msg = ExecuteMsg::CreateOrder {
-            offer_amount: Uint128::new(1000),
-            offer_denom: OFFER_DENOM.to_string(),
-            ask_amount: Uint128::new(5000),
-            ask_denom: ASK_DENOM.to_string(),
-            expires_at,
-        };
-        let info = mock_info(SELLER, &coins(500, OFFER_DENOM));
-        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-        assert!(matches!(err, ContractError::InsufficientPayment { .. }));
-    }
-
-    // ---------- 执行订单（含找零）----------
-
-    #[test]
-    fn execute_order_exact_payment_works() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        create_sample_order(deps.as_mut(), &env);
-
-        let msg = ExecuteMsg::ExecuteOrder { order_id: 1 };
-        let info = mock_info(BUYER, &coins(5000, ASK_DENOM));
-        let res = execute(deps.as_mut(), env, info, msg).unwrap();
-
-        // 4 条消息：给买家 offer、给卖家扣费后、给 fee1、给 fee2（无找零）
-        assert_eq!(res.messages.len(), 4);
-        let change_attr = res.attributes.iter().find(|a| a.key == "change").unwrap();
-        assert_eq!(change_attr.value, "0");
-    }
-
-    #[test]
-    fn execute_order_with_change_refunds_excess() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        create_sample_order(deps.as_mut(), &env);
-
-        // 买家多付 1000，应找零 1000
-        let msg = ExecuteMsg::ExecuteOrder { order_id: 1 };
-        let info = mock_info(BUYER, &coins(6000, ASK_DENOM));
-        let res = execute(deps.as_mut(), env, info, msg).unwrap();
-
-        // 5 条消息：多了一条找零
-        assert_eq!(res.messages.len(), 5);
-
-        let last_msg = res.messages.last().unwrap();
-        if let SubMsg::Bank(BankMsg::Send { to_address, amount }) = last_msg {
-            assert_eq!(to_address, BUYER);
-            assert_eq!(amount, &coins(1000, ASK_DENOM));
-        } else {
-            panic!("最后一条消息应为找零 BankMsg::Send");
-        }
-
-        let change_attr = res.attributes.iter().find(|a| a.key == "change").unwrap();
-        assert_eq!(change_attr.value, "1000");
-    }
-
-    #[test]
-    fn execute_order_rejects_self_trade() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        create_sample_order(deps.as_mut(), &env);
-
-        let msg = ExecuteMsg::ExecuteOrder { order_id: 1 };
-        let info = mock_info(SELLER, &coins(5000, ASK_DENOM));
-        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-        assert_eq!(err, ContractError::SelfTradeNotAllowed);
-    }
-
-    #[test]
-    fn execute_order_rejects_insufficient_payment() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        create_sample_order(deps.as_mut(), &env);
-
-        let msg = ExecuteMsg::ExecuteOrder { order_id: 1 };
-        let info = mock_info(BUYER, &coins(4000, ASK_DENOM));
-        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-        assert!(matches!(err, ContractError::InsufficientPayment { .. }));
-    }
-
-    #[test]
-    fn execute_order_rejects_wrong_denom() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        create_sample_order(deps.as_mut(), &env);
-
-        let msg = ExecuteMsg::ExecuteOrder { order_id: 1 };
-        let info = mock_info(BUYER, &coins(5000, "wrongdenom"));
-        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-        assert!(matches!(err, ContractError::DenomMismatch { .. }));
-    }
-
-    #[test]
-    fn execute_order_rejects_expired() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        let expires_at = future_expires(&env, 1);
-        let create_msg = ExecuteMsg::CreateOrder {
-            offer_amount: Uint128::new(1000),
-            offer_denom: OFFER_DENOM.to_string(),
-            ask_amount: Uint128::new(5000),
-            ask_denom: ASK_DENOM.to_string(),
-            expires_at,
-        };
-        let info = mock_info(SELLER, &coins(1000, OFFER_DENOM));
-        execute(deps.as_mut(), env.clone(), info, create_msg).unwrap();
-
-        let mut env2 = env;
-        env2.block.time = Timestamp::from_seconds(expires_at + 10);
-
-        let msg = ExecuteMsg::ExecuteOrder { order_id: 1 };
-        let info = mock_info(BUYER, &coins(5000, ASK_DENOM));
-        let err = execute(deps.as_mut(), env2, info, msg).unwrap_err();
-        assert_eq!(err, ContractError::OrderExpired);
-    }
-
-    // ---------- 手续费分账 ----------
-
-    #[test]
-    fn fee_split_calculated_correctly() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        create_sample_order(deps.as_mut(), &env);
-
-        // ask=5000, fee_rate=100(1%), split=6000(60%)
-        // fee_total=50, seller=4950, fee1=30, fee2=20
-        let msg = ExecuteMsg::ExecuteOrder { order_id: 1 };
-        let info = mock_info(BUYER, &coins(5000, ASK_DENOM));
-        let res = execute(deps.as_mut(), env, info, msg).unwrap();
-
-        let fee_total = res.attributes.iter().find(|a| a.key == "fee_total").unwrap().value.clone();
-        let fee_to_addr_1 = res.attributes.iter().find(|a| a.key == "fee_to_addr_1").unwrap().value.clone();
-        let fee_to_addr_2 = res.attributes.iter().find(|a| a.key == "fee_to_addr_2").unwrap().value.clone();
-        assert_eq!(fee_total, "50");
-        assert_eq!(fee_to_addr_1, "30");
-        assert_eq!(fee_to_addr_2, "20");
-
-        let seller_msg = &res.messages[1];
-        if let SubMsg::Bank(BankMsg::Send { amount, .. }) = seller_msg {
-            assert_eq!(amount, &coins(4950, ASK_DENOM));
-        }
-    }
-
-    // ---------- 取消挂单 ----------
-
-    #[test]
-    fn cancel_order_works() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        create_sample_order(deps.as_mut(), &env);
-
-        let msg = ExecuteMsg::CancelOrder { order_id: 1 };
-        let info = mock_info(SELLER, &[]);
-        let res = execute(deps.as_mut(), env, info, msg).unwrap();
-        assert_eq!(res.messages.len(), 1);
-    }
-
-    #[test]
-    fn cancel_order_rejects_non_seller() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        create_sample_order(deps.as_mut(), &env);
-
-        let msg = ExecuteMsg::CancelOrder { order_id: 1 };
-        let info = mock_info(BUYER, &[]);
-        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-        assert_eq!(err, ContractError::OnlySellerCanCancel);
-    }
-
-    #[test]
-    fn cancel_order_works_even_when_paused() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        create_sample_order(deps.as_mut(), &env);
-
-        let pause_msg = ExecuteMsg::Pause {};
-        let admin_info = mock_info(ADMIN, &[]);
-        execute(deps.as_mut(), env.clone(), admin_info, pause_msg).unwrap();
-
-        let msg = ExecuteMsg::CancelOrder { order_id: 1 };
-        let info = mock_info(SELLER, &[]);
-        let res = execute(deps.as_mut(), env, info, msg).unwrap();
-        assert_eq!(res.messages.len(), 1);
-    }
-
-    // ---------- 退款 ----------
-
-    #[test]
-    fn refund_order_works_after_expiry() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        let expires_at = future_expires(&env, 1);
-        let create_msg = ExecuteMsg::CreateOrder {
-            offer_amount: Uint128::new(1000),
-            offer_denom: OFFER_DENOM.to_string(),
-            ask_amount: Uint128::new(5000),
-            ask_denom: ASK_DENOM.to_string(),
-            expires_at,
-        };
-        let info = mock_info(SELLER, &coins(1000, OFFER_DENOM));
-        execute(deps.as_mut(), env.clone(), info, create_msg).unwrap();
-
-        let mut env2 = env;
-        env2.block.time = Timestamp::from_seconds(expires_at + 10);
-
-        let msg = ExecuteMsg::RefundOrder { order_id: 1 };
-        let info = mock_info(SELLER, &[]);
-        let res = execute(deps.as_mut(), env2, info, msg).unwrap();
-        assert_eq!(res.messages.len(), 1);
-    }
-
-    #[test]
-    fn refund_order_rejects_before_expiry() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        create_sample_order(deps.as_mut(), &env);
-
-        let msg = ExecuteMsg::RefundOrder { order_id: 1 };
-        let info = mock_info(SELLER, &[]);
-        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-        assert_eq!(err, ContractError::OrderNotExpired);
-    }
-
-    // ---------- 管理员功能 ----------
-
-    #[test]
-    fn pause_blocks_create_but_not_cancel() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        create_sample_order(deps.as_mut(), &env);
-
-        let pause_msg = ExecuteMsg::Pause {};
-        let admin_info = mock_info(ADMIN, &[]);
-        execute(deps.as_mut(), env.clone(), admin_info, pause_msg).unwrap();
-
-        let expires_at = future_expires(&env, 86400);
-        let create_msg = ExecuteMsg::CreateOrder {
-            offer_amount: Uint128::new(1000),
-            offer_denom: OFFER_DENOM.to_string(),
-            ask_amount: Uint128::new(5000),
-            ask_denom: ASK_DENOM.to_string(),
-            expires_at,
-        };
-        let info = mock_info(SELLER, &coins(1000, OFFER_DENOM));
-        let err = execute(deps.as_mut(), env.clone(), info, create_msg).unwrap_err();
-        assert_eq!(err, ContractError::ContractPaused);
-
-        let cancel_msg = ExecuteMsg::CancelOrder { order_id: 1 };
-        let info = mock_info(SELLER, &[]);
-        let res = execute(deps.as_mut(), env, info, cancel_msg).unwrap();
-        assert_eq!(res.messages.len(), 1);
-    }
-
-    #[test]
-    fn update_admin_works() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        let new_admin = "paxi1newadmin";
-        let msg = ExecuteMsg::UpdateAdmin {
-            new_admin: new_admin.to_string(),
-        };
-        let info = mock_info(ADMIN, &[]);
-        let res = execute(deps.as_mut(), env.clone(), info, msg).unwrap();
-        assert_eq!(res.attributes[1].value, new_admin);
-
-        let pause_msg = ExecuteMsg::Pause {};
-        let old_admin_info = mock_info(ADMIN, &[]);
-        let err = execute(deps.as_mut(), env, old_admin_info, pause_msg.clone()).unwrap_err();
-        assert_eq!(err, ContractError::Unauthorized);
-
-        let new_admin_info = mock_info(new_admin, &[]);
-        let res = execute(deps.as_mut(), mock_env(), new_admin_info, pause_msg).unwrap();
-        assert_eq!(res.attributes[1].value, "true");
-    }
-
-    #[test]
-    fn update_admin_rejects_same_address() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        let msg = ExecuteMsg::UpdateAdmin {
-            new_admin: ADMIN.to_string(),
-        };
-        let info = mock_info(ADMIN, &[]);
-        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-        assert_eq!(err, ContractError::SameAdminAddress);
-    }
-
-    #[test]
-    fn update_fee_address_1_rejects_duplicate_with_2() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        let msg = ExecuteMsg::UpdateFeeAddress1 {
-            fee_address_1: FEE_ADDR_2.to_string(),
-        };
-        let info = mock_info(ADMIN, &[]);
-        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-        assert_eq!(err, ContractError::DuplicateFeeAddress);
-    }
-
-    #[test]
-    fn non_admin_cannot_pause() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        let msg = ExecuteMsg::Pause {};
-        let info = mock_info(SELLER, &[]);
-        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
-        assert_eq!(err, ContractError::Unauthorized);
-    }
-
-    // ---------- 查询 ----------
-
-    #[test]
-    fn query_order_count_increments() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        create_sample_order(deps.as_mut(), &env);
-
-        let res: OrderCountResponse = from_binary(
-            &query(deps.as_ref(), mock_env(), QueryMsg::GetOrderCount {}).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(res.count, 1);
-    }
-
-    #[test]
-    fn query_get_order_returns_correct_data() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        create_sample_order(deps.as_mut(), &env);
-
-        let res: Order = from_binary(
-            &query(deps.as_ref(), mock_env(), QueryMsg::GetOrder { order_id: 1 }).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(res.seller, Addr::unchecked(SELLER));
-        assert_eq!(res.offer_amount, Uint128::new(1000));
-        assert_eq!(res.ask_amount, Uint128::new(5000));
-        assert_eq!(res.offer_denom, OFFER_DENOM);
-        assert_eq!(res.ask_denom, ASK_DENOM);
-    }
-
-    #[test]
-    fn query_list_active_orders_filters_correctly() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        for _ in 0..3 {
-            create_sample_order(deps.as_mut(), &env);
-        }
-        let cancel_msg = ExecuteMsg::CancelOrder { order_id: 2 };
-        let info = mock_info(SELLER, &[]);
-        execute(deps.as_mut(), env.clone(), info, cancel_msg).unwrap();
-
-        let res: OrdersResponse = from_binary(
-            &query(
-                deps.as_ref(),
-                mock_env(),
-                QueryMsg::ListActiveOrders {
-                    start_after: None,
-                    limit: Some(100),
-                },
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(res.orders.len(), 2);
-        assert_eq!(res.orders[0].id, 1);
-        assert_eq!(res.orders[1].id, 3);
-    }
-
-    // ---------- Migrate ----------
-
-    #[test]
-    fn migrate_works() {
-        let mut deps = mock_dependencies();
-        let env = init_contract(deps.as_mut());
-        let msg = MigrateMsg::default();
-        let res = migrate(deps.as_mut(), env, msg).unwrap();
-        assert_eq!(res.attributes[0].value, "migrate");
-    }
 }

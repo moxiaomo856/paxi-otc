@@ -1,14 +1,8 @@
-use cosmwasm_std::Uint128;
+use cosmwasm_std::{Addr, Uint128};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::state::{Config, Order, OrderStatus};
-
-// ----------------------------------------------------
-// MigrateMsg - 合约升级时传入的参数（当前为空，仅更新版本号）
-// ----------------------------------------------------
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, Default)]
-pub struct MigrateMsg {}
 
 // ----------------------------------------------------
 // InstantiateMsg - 部署时传入的参数
@@ -44,7 +38,7 @@ pub enum ExecuteMsg {
         ask_amount: Uint128,
         /// 求购代币（你想换什么币）
         ask_denom: String,
-        /// 过期时间（Unix 秒，距当前时间不得超过 90 天）
+        /// 过期区块高度
         expires_at: u64,
     },
     /// 执行订单（买家买入）
@@ -73,20 +67,10 @@ pub enum ExecuteMsg {
         /// 新的手续费比例（万分比）
         new_fee_rate: u64,
     },
-    /// 修改手续费收款地址（同时更新两个）
+    /// 修改手续费收款地址
     UpdateFeeAddresses {
         /// 新的收款地址 1
         fee_address_1: String,
-        /// 新的收款地址 2
-        fee_address_2: String,
-    },
-    /// 仅修改手续费收款地址 1
-    UpdateFeeAddress1 {
-        /// 新的收款地址 1
-        fee_address_1: String,
-    },
-    /// 仅修改手续费收款地址 2
-    UpdateFeeAddress2 {
         /// 新的收款地址 2
         fee_address_2: String,
     },
@@ -94,11 +78,6 @@ pub enum ExecuteMsg {
     UpdateFeeSplit {
         /// 新的分账比例（地址1占比，万分比）
         new_split_ratio: u64,
-    },
-    /// 转移管理员权限
-    UpdateAdmin {
-        /// 新的管理员地址
-        new_admin: String,
     },
     /// 添加白名单
     AddToWhitelist {

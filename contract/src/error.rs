@@ -12,6 +12,9 @@ pub enum ContractError {
     #[error("合约已暂停")]
     ContractPaused,
 
+    #[error("订单不存在")]
+    OrderNotFound,
+
     #[error("订单不在活跃状态")]
     OrderNotActive,
 
@@ -42,11 +45,8 @@ pub enum ContractError {
     #[error("必须且只能发送一种代币作为挂单资产")]
     InvalidFunds,
 
-    #[error("过期时间必须大于当前时间")]
+    #[error("过期时间必须大于当前区块高度")]
     InvalidExpiration,
-
-    #[error("过期时间超出最大有效期（90 天）")]
-    ExpirationTooFar,
 
     #[error("手续费比例必须在 0-10000 之间")]
     InvalidFeeRate,
@@ -56,6 +56,12 @@ pub enum ContractError {
 
     #[error("支付不足：需要 {expected}，实际支付 {actual}")]
     InsufficientPayment {
+        expected: String,
+        actual: String,
+    },
+
+    #[error("支付过多：需要 {expected}，实际支付 {actual}")]
+    ExcessivePayment {
         expected: String,
         actual: String,
     },
@@ -77,16 +83,4 @@ pub enum ContractError {
 
     #[error("白名单已开启，你的地址不在白名单中")]
     NotInWhitelist,
-
-    #[error("卖家不能购买自己的订单")]
-    SelfTradeNotAllowed,
-
-    #[error("挂单代币和求购代币不能相同")]
-    SameDenomNotAllowed,
-
-    #[error("两个手续费收款地址不能相同")]
-    DuplicateFeeAddress,
-
-    #[error("新管理员地址与当前管理员相同")]
-    SameAdminAddress,
 }
