@@ -364,14 +364,16 @@ async function loadActiveOrders() {
   if (!listEl) return;
   listEl.innerHTML = `<div style="text-align:center;padding:20px"><span class="spinner"></span> ${t('loading')}</div>`;
   try {
-    const orders = await queryContractSmart(state.contractAddr, {
+    const res = await queryContractSmart(state.contractAddr, {
       list_active_orders: { limit: 100 }
     });
-    state.activeOrders = orders || [];
+    // 新版合约返回 { orders: [...] }，兼容直接返回数组的老版本
+    state.activeOrders = Array.isArray(res) ? res : (res && res.orders) || [];
     try {
-      const count = await queryContractSmart(state.contractAddr, { get_order_count: {} });
-      state.orderCount = count || 0;
+      const countRes = await queryContractSmart(state.contractAddr, { get_order_count: {} });
+      state.orderCount = typeof countRes === 'number' ? countRes : (countRes && countRes.count) || 0;
     } catch (e) {}
+    fetchBlockHeight().catch(() => {});
     const statTotal = document.getElementById('statTotal');
     const statActive = document.getElementById('statActive');
     if (statTotal) statTotal.textContent = state.orderCount;
@@ -508,6 +510,28 @@ function getDenomDecimals(denom) {
   return info ? info.decimals : 0;
 }
 
+// ============================================================
+// 区块高度工具（新合约的 expires_at 是区块高度，不是时间戳）
+// ============================================================
+const PAXI_BLOCK_SECONDS = 4.5; // Paxi 主网平均出块间隔（秒）
+let _cachedBlockHeight = 0;
+let _cachedBlockTs = 0;
+
+async function fetchBlockHeight() {
+  const now = Date.now();
+  if (_cachedBlockHeight && now - _cachedBlockTs < 15000) return _cachedBlockHeight;
+  // 优先标准 Cosmos 路径；Paxi LCD 不支持 Tendermint 老式 /blocks/latest（501）
+  let res = await fetch(`${getLCD()}/cosmos/base/tendermint/v1beta1/blocks/latest`);
+  if (!res.ok) {
+    res = await fetch(`${getLCD()}/blocks/latest`);
+  }
+  if (!res.ok) throw new Error(`获取区块高度失败: HTTP ${res.status}`);
+  const data = await res.json();
+  _cachedBlockHeight = parseInt(data.block?.header?.height || '0', 10);
+  _cachedBlockTs = now;
+  return _cachedBlockHeight;
+}
+
 async function submitCreateOrder() {
   if (!state.connected || !state.wallet) { showToast(t('pleaseConnectWallet'), 'error'); return; }
   const btn = document.getElementById('btnCreateOrder');
@@ -549,11 +573,22 @@ async function submitCreateOrder() {
   showStatus('createOrderStatus', t('buildingTxInfo'), 'info');
 
   try {
+    // 换算过期区块高度：timeoutVal 是秒数，链上按出块间隔折算
+    const currentHeight = await fetchBlockHeight();
+    let expiresAt;
+    if (timeoutVal === 0) {
+      expiresAt = currentHeight + 100000000; // “永久” ≈ 14 年后的区块高度
+    } else {
+      expiresAt = currentHeight + Math.ceil(timeoutVal / PAXI_BLOCK_SECONDS);
+    }
+
     const executeMsg = {
       create_order: {
-        ask_denom: askDenom,
+        offer_amount: offerRaw,
+        offer_denom: offerDenom,
         ask_amount: askRaw,
-        timeout: timeoutVal === 0 ? null : timeoutVal,
+        ask_denom: askDenom,
+        expires_at: expiresAt
       }
     };
 
@@ -602,10 +637,11 @@ async function loadMyOrders() {
   if (!listEl) return;
   listEl.innerHTML = `<div style="text-align:center;padding:20px"><span class="spinner"></span> ${t('loading')}</div>`;
   try {
-    const orders = await queryContractSmart(state.contractAddr, {
+    const res = await queryContractSmart(state.contractAddr, {
       list_orders_by_seller: { seller: state.wallet.address }
     });
-    state.myOrders = orders || [];
+    state.myOrders = Array.isArray(res) ? res : (res && res.orders) || [];
+    fetchBlockHeight().catch(() => {});
     if (state.myOrders.length === 0) {
       listEl.innerHTML = `<div class="empty-state"><div class="icon">📭</div><div class="text">${t('noOrderRecords')}</div></div>`;
       return;
@@ -645,9 +681,15 @@ function renderOrderCard(order, context) {
   const seller = order.seller || '';
   const sellerShort = seller.slice(0, 10) + '...' + seller.slice(-6);
   const isOwn = state.wallet && seller === state.wallet.address;
-  const now = Math.floor(Date.now() / 1000);
-  const expired = now > Number(order.expires_at);
-  const timeLeft = expired ? t('expired') : formatTimeLeft(Number(order.expires_at) - now);
+  // 新合约的 expires_at 是区块高度，按出块间隔换算剩余时间
+  const curH = _cachedBlockHeight || 0;
+  const expiresH = Number(order.expires_at) || 0;
+  let expired = false;
+  let timeLeft = '-';
+  if (curH > 0 && expiresH > 0) {
+    expired = curH >= expiresH;
+    timeLeft = expired ? t('expired') : formatTimeLeft(Math.round((expiresH - curH) * PAXI_BLOCK_SECONDS));
+  }
 
   let priceText = '-';
   try {
@@ -716,7 +758,7 @@ async function buyOrder(orderId, askDenom, askAmount) {
   if (!confirm(`${t('confirmBuy')}\n${t('needPay')}${askDisplay} ${askInfo.display}\n${t('orderNo')}#${orderId}`)) return;
 
   try {
-    const executeMsg = { execute_order: { id: orderId } };
+    const executeMsg = { execute_order: { order_id: orderId } };
     const funds = [{ denom: askDenom, amount: askAmount }];
     const result = await executeContract(executeMsg, funds, `Paxi OTC: Buy Order #${orderId}`);
 
@@ -744,7 +786,7 @@ async function buyOrder(orderId, askDenom, askAmount) {
 async function cancelOrder(orderId) {
   if (!confirm(`${t('confirmCancel')}${orderId}${t('cancelRefundHint')}`)) return;
   try {
-    const executeMsg = { cancel_order: { id: orderId } };
+    const executeMsg = { cancel_order: { order_id: orderId } };
     const result = await executeContract(executeMsg, [], `Paxi OTC: Cancel Order #${orderId}`);
     if (result.ok) {
       showToast(t('cancelSuccess'), 'success');
@@ -765,7 +807,7 @@ async function cancelOrder(orderId) {
 async function refundOrder(orderId) {
   if (!confirm(`${t('confirmRefund')}${orderId}${t('cancelRefundHint')}`)) return;
   try {
-    const executeMsg = { refund_order: { id: orderId } };
+    const executeMsg = { refund_order: { order_id: orderId } };
     const result = await executeContract(executeMsg, [], `Paxi OTC: Refund Order #${orderId}`);
     if (result.ok) {
       showToast(t('refundSuccess'), 'success');
