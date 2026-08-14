@@ -15,6 +15,7 @@ jobs:
       - name: Build optimized Wasm
         run: |
           cd contract
+          rm -f Cargo.lock
           docker run --rm -v "$(pwd)":/code cosmwasm/optimizer:0.16.0
 
       - name: Upload artifacts
