@@ -1,0 +1,23 @@
+name: Build OTC Contract (Optimized)
+
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build optimized Wasm
+        run: |
+          docker run --rm -v "$(pwd)":/code cosmwasm/optimizer:0.16.0
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: paxi-otc-wasm
+          path: artifacts/
