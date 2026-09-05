@@ -174,6 +174,14 @@ const I18N = {
 
   // ===== Errors =====
   errorInvalidAmount: { zh: '数量必须大于 0', en: 'Amount must be greater than 0' },
+
+  // ===== 新增市场相关 =====
+  price: { zh: '现价', en: 'Price' },
+  depth: { zh: '深度', en: 'Depth' },
+  orderBook: { zh: '盘口', en: 'Order Book' },
+  activeOrders: { zh: '活跃挂单', en: 'Active Orders' },
+  // buy 和 sell 已存在，但为了覆盖，保留原名；若需要区分，可新增 buySide/sellSide
+  // 但我们已有 buy/sell，就不再重复
 };
 
 // ============================================================
